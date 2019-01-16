@@ -4,13 +4,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	log "github.com/Sirupsen/logrus"
-	"github.com/cloudflare/goflow/decoders"
-	"github.com/cloudflare/goflow/decoders/netflow"
-	"github.com/cloudflare/goflow/decoders/sflow"
-	flowmessage "github.com/cloudflare/goflow/pb"
-	"github.com/cloudflare/goflow/producer"
-	"github.com/cloudflare/goflow/transport"
 	"net"
 	"os"
 	"runtime"
@@ -19,9 +12,18 @@ import (
 	"sync"
 	"time"
 
+	log "github.com/Sirupsen/logrus"
+	decoder "github.com/cloudflare/goflow/decoders"
+	"github.com/cloudflare/goflow/decoders/netflow"
+	"github.com/cloudflare/goflow/decoders/sflow"
+	flowmessage "github.com/cloudflare/goflow/pb"
+	"github.com/cloudflare/goflow/producer"
+	"github.com/cloudflare/goflow/transport"
+
+	"net/http"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"net/http"
 
 	"encoding/json"
 
@@ -46,6 +48,7 @@ var (
 	LogFmt   = flag.String("logfmt", "normal", "Log formatter")
 
 	EnableKafka  = flag.Bool("kafka", true, "Enable Kafka")
+	EnableZeroMQ = flag.Bool("zeromq", false, "Enable ZeroMQ")
 	MetricsAddr  = flag.String("metrics.addr", ":8080", "Metrics address")
 	MetricsPath  = flag.String("metrics.path", "/metrics", "Metrics path")
 	TemplatePath = flag.String("templates.path", "/templates", "NetFlow/IPFIX templates list")
@@ -56,7 +59,9 @@ var (
 	KafkaSrv   = flag.String("kafka.out.srv", "", "SRV record containing a list of Kafka brokers (or use kafka.out.brokers)")
 	KafkaBrk   = flag.String("kafka.out.brokers", "127.0.0.1:9092,[::1]:9092", "Kafka brokers list separated by commas")
 
-	Version = flag.Bool("v", false, "Print version")
+	ZeroMQUri   = flag.String("zeromq.uri", "tcp://*:5556", "Uri for zeromq to bind and listen to")
+	ZeroMQTopic = flag.String("zeromq.topic", "msg", "topic for zeromq to publish flows on")
+	Version     = flag.Bool("v", false, "Print version")
 )
 
 func init() {
@@ -384,17 +389,17 @@ func (s *state) decodeNetFlow(msg interface{}) error {
 }
 
 func FlowMessageToString(fmsg *flowmessage.FlowMessage) string {
-	s := fmt.Sprintf("Type:%v TimeRecvd:%v SamplingRate:%v SequenceNum:%v TimeFlow:%v " +
-					"SrcIP:%v DstIP:%v IPversion:%v Bytes:%v Packets:%v RouterAddr:%v NextHop:%v NextHopAS:%v " +
-					"SrcAS:%v DstAS:%v SrcNet:%v DstNet:%v SrcIf:%v DstIf:%v Proto:%v " +
-					"SrcPort:%v DstPort:%v IPTos:%v ForwardingStatus:%v IPTTL:%v TCPFlags:%v " +
-					"SrcMac:%v DstMac:%v VlanId:%v Etype:%v IcmpType:%v IcmpCode:%v " +
-					"SrcVlan:%v DstVlan:%v IPv6FlowLabel:%v",
-		fmsg.Type, fmsg.TimeRecvd, fmsg.SamplingRate, fmsg.SequenceNum, fmsg.TimeFlow, 
-		net.IP(fmsg.SrcIP), net.IP(fmsg.DstIP), fmsg.IPversion, fmsg.Bytes, fmsg.Packets, net.IP(fmsg.RouterAddr), net.IP(fmsg.NextHop), fmsg.NextHopAS, 
-		fmsg.SrcAS, fmsg.DstAS, fmsg.SrcNet, fmsg.DstNet, fmsg.SrcIf, fmsg.DstIf, fmsg.Proto, 
-		fmsg.SrcPort, fmsg.DstPort, fmsg.IPTos, fmsg.ForwardingStatus, fmsg.IPTTL, fmsg.TCPFlags, 
-		fmsg.SrcMac, fmsg.DstMac, fmsg.VlanId, fmsg.Etype, fmsg.IcmpType, fmsg.IcmpCode, 
+	s := fmt.Sprintf("Type:%v TimeRecvd:%v SamplingRate:%v SequenceNum:%v TimeFlow:%v "+
+		"SrcIP:%v DstIP:%v IPversion:%v Bytes:%v Packets:%v RouterAddr:%v NextHop:%v NextHopAS:%v "+
+		"SrcAS:%v DstAS:%v SrcNet:%v DstNet:%v SrcIf:%v DstIf:%v Proto:%v "+
+		"SrcPort:%v DstPort:%v IPTos:%v ForwardingStatus:%v IPTTL:%v TCPFlags:%v "+
+		"SrcMac:%v DstMac:%v VlanId:%v Etype:%v IcmpType:%v IcmpCode:%v "+
+		"SrcVlan:%v DstVlan:%v IPv6FlowLabel:%v",
+		fmsg.Type, fmsg.TimeRecvd, fmsg.SamplingRate, fmsg.SequenceNum, fmsg.TimeFlow,
+		net.IP(fmsg.SrcIP), net.IP(fmsg.DstIP), fmsg.IPversion, fmsg.Bytes, fmsg.Packets, net.IP(fmsg.RouterAddr), net.IP(fmsg.NextHop), fmsg.NextHopAS,
+		fmsg.SrcAS, fmsg.DstAS, fmsg.SrcNet, fmsg.DstNet, fmsg.SrcIf, fmsg.DstIf, fmsg.Proto,
+		fmsg.SrcPort, fmsg.DstPort, fmsg.IPTos, fmsg.ForwardingStatus, fmsg.IPTTL, fmsg.TCPFlags,
+		fmsg.SrcMac, fmsg.DstMac, fmsg.VlanId, fmsg.Etype, fmsg.IcmpType, fmsg.IcmpCode,
 		fmsg.SrcVlan, fmsg.DstVlan, fmsg.IPv6FlowLabel)
 	return s
 }
@@ -403,6 +408,9 @@ func (s *state) produceFlow(fmsgset []*flowmessage.FlowMessage) {
 	for _, fmsg := range fmsgset {
 		if s.kafkaEn {
 			s.kafkaState.SendKafkaFlowMessage(fmsg)
+		}
+		if s.zeromqEn {
+			s.zeromqState.SendZeroMQFlowMessage(fmsg)
 		}
 		if s.debug {
 			log.Debug(FlowMessageToString(fmsg))
@@ -626,8 +634,10 @@ func (s *state) accountCallback(name string, id int, start, end time.Time) {
 }
 
 type state struct {
-	kafkaState *transport.KafkaState
-	kafkaEn    bool
+	kafkaState  *transport.KafkaState
+	kafkaEn     bool
+	zeromqState *transport.ZeroMQState
+	zeromqEn    bool
 
 	templateslock *sync.RWMutex
 	templates     map[string]*TemplateSystem
@@ -771,6 +781,11 @@ func main() {
 		kafkaState := transport.StartKafkaProducer(addrs, *KafkaTopic, *KafkaTLS, *KafkaSASL)
 		s.kafkaState = kafkaState
 		s.kafkaEn = true
+	}
+	if *EnableZeroMQ {
+		zeromqState := transport.StartZeroMQTransport(*ZeroMQUri, *ZeroMQTopic)
+		s.zeromqState = zeromqState
+		s.zeromqEn = true
 	}
 
 	if *FEnable {
